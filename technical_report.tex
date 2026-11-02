@@ -1,0 +1,277 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+\title{From Tracking to Possession\\\large A Reproducible Estimator for More Than A Hack 2027}
+\author{Technical report for the Phase 1 submission}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The task is to assign one of four labels to every frame of a football match: home possession,
+away possession, dead ball, or abstention. The central difficulty is not detecting the players;
+automatic tracking is supplied. It is inferring controlled possession from a noisy ball track,
+fragmented player tracks, and imperfect automatic tactical tags. This report explains a
+tracking-first estimator in physical and algorithmic terms. It combines pitch-metric proximity,
+temporal persistence, restart evidence, and explicit stoppage signals. The model is deterministic
+and reproducible, with fixed heuristic thresholds rather than learned parameters. It uses no video
+or human labels as runtime inputs.
+\end{abstract}
+
+\section{What the challenge asks}
+
+For each frame $t$ in the tactical recording, emit a label
+\[
+  y_t \in \{H,A,D,X\},
+\]
+where $H$ and $A$ mean that the home or away team controls the live ball, $D$ means that the ball is
+not in play, and $X$ means that the estimator abstains. A possession is a maximal continuous run of
+one team's live-ball labels. A dead-ball interval terminates one possession and precedes another;
+it is not itself a possession.
+
+The output is indexed by tactical-video frames and must contain exactly 199,319 rows, numbered
+0--199,318. The match runs at 25 frames per second. Of these frames, 158,857 are graded. The supplied
+tracking is automatic and uncorrected; in particular, the ball is absent in about 41\% of graded
+frames, and the 46 player track slots are temporary tracklets rather than persistent player
+identities.
+
+\subsection{Why the ranking metric changes the engineering problem}
+
+The ranking metric is \emph{spellF1}. It compares whole possession intervals using temporal
+intersection-over-union and one-to-one matching, averaged over IoU thresholds 0.3--0.7. A system
+that predicts many short possession fragments can have reasonable frame labels and still miss the
+ranking objective. The first tie-break is macroF1, the unweighted mean of frame-level F1 for $H$,
+$A$, and $D$.
+
+The scorer fills $X$ with the previous non-$X$ label within the same half before computing spellF1.
+Consequently, $X$ is not a neutral gap at a transition: it can extend the old possession across a
+turnover. The estimator therefore carries its current team through ordinary tracking gaps, but
+does not use abstention as a substitute for deciding a detected change of control.
+
+\section{Available measurements and their interpretation}
+
+The model uses only the tactical source:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{FIFA/EPTS ATD metadata}: team membership of each track slot, frame rate, and pitch
+        dimensions.
+  \item \textbf{Raw ATD}: normalized $(x,y)$ positions of each tracked player and the ball, with
+        optional speed measurements.
+  \item \textbf{Smart Tagging}: automatic phase intervals, team tags, set-piece events, and goal
+        events. These tags are evidence, not ground truth labels.
+\end{enumerate}
+
+The video is not decoded. The homography maps pitch coordinates to image pixels and adds no
+independent signal when no image pixels are used. The broadcast recording has a different,
+unsynchronized timeline and is omitted. These choices keep the pipeline lightweight and portable
+to another match with the same tactical data format.
+
+\section{The estimator as a noisy-measurement model}
+
+The conceptual state is the live possessor $s_t\in\{H,A\}$, with a separate dead-ball state. At each
+frame, the estimator asks two questions:
+\begin{enumerate}[leftmargin=*]
+  \item Is there evidence that play is stopped?
+  \item If play is live, which team has the stronger evidence of controlling the ball?
+\end{enumerate}
+
+This is analogous to inferring a discrete physical state from noisy sensors. The ATD geometry is the
+primary sensor. Smart Tagging supplies a weak, correlated prior because it is generated
+automatically from the same match. Temporal persistence encodes the physical distinction between a
+touch and controlled possession. The numerical scores below are heuristic evidence scores, not
+calibrated probabilities.
+
+\subsection{Distance in pitch coordinates}
+
+The ATD positions are normalized to the pitch. Let the pitch length and width be $L$ and $W$, the
+ball position be $(x_b(t),y_b(t))$, and a player position be $(x_i(t),y_i(t))$. Convert normalized
+coordinate differences to metres:
+\[
+  d_i(t)=\sqrt{\left[L(x_b(t)-x_i(t))\right]^2+
+                   \left[W(y_b(t)-y_i(t))\right]^2}.
+\]
+This anisotropic scaling matters: the pitch is rectangular, so an unscaled Euclidean distance in
+normalized coordinates would distort proximity, especially along the shorter axis.
+
+For each team $g\in\{H,A\}$, let $d_g(t)$ be the smallest finite distance to a tracked player on
+that team. If the ball is not observed, the frame contributes no new team evidence. Otherwise,
+\[
+  e_g(t)=\begin{cases}
+    \exp[-d_g(t)/\lambda], & d_g(t)<R,\\
+    0, & d_g(t)\ge R,
+  \end{cases}
+  \qquad R=4.5\,\mathrm{m},\quad \lambda=1.8\,\mathrm{m}.
+\]
+The exponential gives a nearby player more weight than a distant one, while the finite range stops
+a far-away track from claiming the ball. The score is not a claim that the nearest player always
+controls the ball; it is an observation whose interpretation is stabilized in time.
+
+\subsection{Weak use of team phase tags}
+
+When an ordinary phase tag names a team, its score is increased by a small bonus $\beta=0.25$ only
+if direct ball/player evidence already exists:
+\[
+  e'_g(t)=e_g(t)+\beta\,\mathbf{1}[e_g(t)>0].
+\]
+Overlapping tags do not accumulate without bound. A team tag by itself cannot invent possession
+when the ball is unobserved. This is important because the tagger is automatic and its phase
+intervals are not possession intervals.
+
+\section{Dead ball and restart logic}
+
+The estimator makes dead-ball decisions from event semantics and kinematics rather than treating
+every tagged phase as a stopped play.
+
+\subsection{Set-piece phase: stop first, then detect the restart}
+
+A \texttt{SET PIECES} interval can contain both the stoppage and live play after the restart. The
+algorithm therefore marks it dead only from the tag's start up to the first controlled-motion
+evidence. It uses the provider's ball speed where present. When speed is missing, it estimates speed
+from successive observed positions, preferring the longest available short lag (4, then 3, 2, or 1
+frames):
+\[
+  \widehat v_b(t)=\frac{\|\mathbf r_b(t)-\mathbf r_b(t-k)\|}{k/\mathrm{fps}}.
+\]
+A candidate restart requires all three of the following:
+\begin{itemize}[leftmargin=*]
+  \item the ball is observed;
+  \item its measured or displacement-derived speed is at least $0.8\,\mathrm{m\,s^{-1}}$;
+  \item the ball is within $4.5\,\mathrm{m}$ of a tracked player.
+\end{itemize}
+The first run of three consecutive candidate frames is taken as the restart boundary. This rejects
+single-frame motion noise and gives an operational meaning to "play has resumed." If no such run
+occurs inside the tagged interval, the interval remains dead-ball evidence through its end.
+
+When a set-piece tag identifies the restarting team, it adds a weak bonus of 0.35 for 1.2 seconds
+after the detected restart, and only while direct ball/player evidence is present. For a
+\texttt{Kick Off (After Goal)} whose team is \texttt{N/A}, the restarting side is inferred as the
+opponent of the team in a nearby \texttt{GOALS} interval (within ten seconds of its end).
+
+\subsection{Goals and ball out of play}
+
+An automatic \texttt{GOALS} interval is treated as a dead-ball interval. Its time span runs from the
+scoring event through the stoppage and typically to the following kickoff. Independently, a ball
+track that lies beyond the normalized pitch rectangle by more than 0.005 for at least five
+consecutive frames is labeled dead ball over that sustained run. Shorter excursions are ignored to
+reduce sensitivity to coordinate noise. The latter rule is physically motivated by the ball having
+left the field, but it can confuse an airborne-ball localization error with a true out-of-play ball.
+
+All dead-ball frames reset the live possessor. Evidence smoothing is done separately on the live
+segments on either side of a stoppage, so a previous team's evidence cannot leak through $D$.
+
+\section{Temporal decision rule for possession}
+
+Within each live segment, the team evidence is averaged over a centered radius of 0.28 seconds. Let
+the resulting scores be $\widetilde e_H(t)$ and $\widetilde e_A(t)$. A candidate is the team with
+the larger score. It must first have some support:
+\begin{enumerate}[leftmargin=*]
+  \item the larger score is at least 0.12.
+\end{enumerate}
+
+If no team has yet been established, the first supported candidate initializes the state. Once a
+team is established, a change requires the opposing score to exceed the current team's score by at
+least 0.12 continuously for 1.2 seconds (30 frames at 25 fps). When confirmed, the algorithm
+backdates the change to the first frame of that uninterrupted evidence run. Brief touches or noisy
+nearest-player changes therefore do not cause a turnover, while a persistent recovery can. If
+neither team has sufficient evidence, the current possessor is retained; before any possessor is
+established, the output is $X$.
+
+In pseudocode, the live-state logic is:
+\begin{lstlisting}
+if dead_ball:
+    output D; clear current possessor
+elif neither team has supported evidence:
+    output current possessor, or X if none exists
+elif no current possessor:
+    initialize to strongest supported team
+elif opposing advantage persists for 1.2 s:
+    change state at the beginning of that evidence run
+else:
+    retain current possessor
+\end{lstlisting}
+
+The persistence interval operationalizes the challenge's notion of controlled possession. It is
+not a claim that all real possession changes take exactly 1.2 seconds; the interval is a generic
+noise filter intended to reject transient contact.
+
+\section{Implementation and reproducibility}
+
+The implementation is \texttt{possession.py}; it uses Python's standard library and NumPy. It reads
+team membership, frame rate, and pitch dimensions from the metadata, checks that ATD frame IDs start
+at one and are contiguous, and derives the output row count from the tracking file. No club name,
+match frame range, or team ID is hard-coded. The resulting CSV uses the exact header
+\texttt{frame,label} and enumerates frames from zero.
+
+From the standalone package directory:
+\begin{lstlisting}
+python3 -m pip install -r requirements.txt
+python3 possession.py \
+  --data-dir /path/to/match-data/tactical \
+  --out submission.csv
+python3 -m unittest -v test_possession.py
+\end{lstlisting}
+
+For this match, the generated \texttt{submission.csv} has 199,319 rows and passes the competition
+repository's submission validator. Re-running the estimator with the same inputs produced the
+same CSV byte-for-byte. The local CSV is ignored by the package's \texttt{.gitignore}; it should be
+uploaded separately as the possession-file deliverable rather than published in the code
+repository. The match data is not included in this package.
+
+\section{Validation history and compliance}
+
+The full-match private ground truth was not accessed and no human labels were used to train a model.
+However, public labels were used during development beyond checking file format and alignment:
+earlier versions were scored, their possession/dead-ball summaries were examined, the persistence
+duration was changed from 0.55 to 1.2 seconds after inspecting one result, and the public dead-ball
+prevalence informed later investigation of stoppage detection. This was use of the public labels to
+guide algorithm development, contrary to the repository's instruction that the public sample is
+for pipeline checking rather than tuning. The final revision has not been rescored, but it inherits
+that development history; it cannot be represented as having been developed independently of the
+public labels. There was no automated parameter sweep, but the manual changes still constitute
+public-label-informed tuning. Before submitting this result, the team should seek guidance from the
+organizers on whether the development history is acceptable.
+
+The package includes 13 synthetic tests of invariants such as short touches not switching state,
+missing ball observations preserving the current possessor, restarts ending dead-ball states,
+and smoothing not crossing a dead-ball boundary. These tests verify implementation behavior, not
+real-match accuracy.
+
+\section{Limitations and next evidence needed}
+
+The estimator's principal limitation is identifiability: proximity is not the same as control. A
+ball can pass close to an opponent without being intercepted, a rebound can resemble a controlled
+touch, and aerial ball coordinates can be unreliable. The 2D tracking omits some of the information
+that a human analyst uses, such as body orientation, contact, and whether a player deliberately
+played the ball. Smart Tagging is also generated automatically and shares some failure modes with
+the tracking.
+
+Without labels from other matches, it is not possible to establish that the heuristic thresholds
+generalize optimally. A stronger scientific validation would use independently labeled matches
+(permitted by the rules), partition them by match, calibrate only on training matches, and report
+held-out spellF1 and macroF1 with uncertainty intervals. The public five-minute slice from this
+match is too small and is explicitly not a tuning set. Accordingly, this report describes a
+reproducible estimator and its assumptions, not a guarantee of winning or a claim of measured
+full-match superiority.
+
+\section*{Competition references}
+The task definitions, allowed-use rules, file contract, and metric details are specified in the
+competition repository's \texttt{CHALLENGE.md}, \texttt{RULES.md}, \texttt{SUBMISSION.md},
+\texttt{DATA.md}, and \texttt{EVALUATION.md}. The evaluator's metric implementation is the final
+authority for scoring.
+
+\end{document}
